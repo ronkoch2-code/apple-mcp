@@ -3,9 +3,40 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as applescript from "./applescript.js";
+import {
+  parsePolicyFromArgv,
+  isPolicyActive,
+  isReadAllowlistActive,
+  checkWritePolicy,
+  checkReadPolicy,
+  filterFoldersByReadPolicy,
+  type WriteOp,
+  type PolicyCheckArgs,
+} from "./policy.js";
 
 const readOnly = process.argv.includes("--read-only");
 const confirmDestructive = process.argv.includes("--confirm-destructive");
+const writePolicy = parsePolicyFromArgv(process.argv);
+const policyActive = isPolicyActive(writePolicy);
+const readAllowlistActive = isReadAllowlistActive(writePolicy);
+
+function policyDenial(op: WriteOp, args: PolicyCheckArgs): { content: [{ type: "text"; text: string }]; isError: true } | null {
+  const result = checkWritePolicy(writePolicy, op, args);
+  if (result.allowed) return null;
+  return {
+    content: [{ type: "text", text: `Policy error: ${result.reason}` }],
+    isError: true,
+  };
+}
+
+function readDenial(folder: string | undefined): { content: [{ type: "text"; text: string }]; isError: true } | null {
+  const result = checkReadPolicy(writePolicy, folder);
+  if (result.allowed) return null;
+  return {
+    content: [{ type: "text", text: `Policy error: ${result.reason}` }],
+    isError: true,
+  };
+}
 
 const server = new McpServer({
   name: "apple-notes",
@@ -16,13 +47,16 @@ const server = new McpServer({
 server.registerTool(
   "list_folders",
   {
-    description: "List all folders in Apple Notes",
+    description: readAllowlistActive
+      ? "List folders in Apple Notes (filtered to the configured read allowlist for this session)"
+      : "List all folders in Apple Notes",
     inputSchema: z.object({}),
   },
   async () => {
     try {
       const folders = await applescript.listFolders();
-      return { content: [{ type: "text", text: JSON.stringify(folders, null, 2) }] };
+      const visible = filterFoldersByReadPolicy(writePolicy, folders);
+      return { content: [{ type: "text", text: JSON.stringify(visible, null, 2) }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Error: ${(err as Error).message}` }], isError: true };
     }
@@ -39,6 +73,8 @@ server.registerTool(
     }),
   },
   async ({ name }) => {
+    const denial = policyDenial("create_folder", { folderName: name });
+    if (denial) return denial;
     try {
       const result = await applescript.createFolder(name);
       return { content: [{ type: "text", text: result }] };
@@ -58,6 +94,8 @@ server.registerTool(
     }),
   },
   async ({ folder }) => {
+    const denial = readDenial(folder);
+    if (denial) return denial;
     try {
       const notes = await applescript.listNotes(folder);
       return { content: [{ type: "text", text: JSON.stringify(notes, null, 2) }] };
@@ -78,6 +116,8 @@ server.registerTool(
     }),
   },
   async ({ title, folder }) => {
+    const denial = readDenial(folder);
+    if (denial) return denial;
     try {
       const note = await applescript.getNote(title, folder);
       return { content: [{ type: "text", text: JSON.stringify(note, null, 2) }] };
@@ -99,6 +139,8 @@ server.registerTool(
     }),
   },
   async ({ title, body, folder }) => {
+    const denial = policyDenial("create_note", { title, folder });
+    if (denial) return denial;
     try {
       const result = await applescript.createNote(title, body, folder);
       return { content: [{ type: "text", text: result }] };
@@ -120,6 +162,8 @@ server.registerTool(
     }),
   },
   async ({ title, body, folder }) => {
+    const denial = policyDenial("update_note", { title, folder });
+    if (denial) return denial;
     try {
       const result = await applescript.updateNote(title, body, folder);
       return { content: [{ type: "text", text: result }] };
@@ -142,6 +186,8 @@ if (!readOnly) {
       }),
     },
     async ({ title, folder, confirm }: { title: string; folder?: string; confirm?: unknown }) => {
+      const denial = policyDenial("delete_note", { title, folder });
+      if (denial) return denial;
       if (confirmDestructive && !confirm) {
         return { content: [{ type: "text", text: "This will permanently delete the note. Please confirm with the user, then call again with confirm: true." }] };
       }
@@ -165,6 +211,8 @@ if (!readOnly) {
       }),
     },
     async ({ name, confirm }: { name: string; confirm?: unknown }) => {
+      const denial = policyDenial("delete_folder", { folderName: name });
+      if (denial) return denial;
       if (confirmDestructive && !confirm) {
         return { content: [{ type: "text", text: "This will permanently delete the folder and all notes inside it. Please confirm with the user, then call again with confirm: true." }] };
       }
@@ -190,6 +238,8 @@ server.registerTool(
     }),
   },
   async ({ title, from_folder, to_folder }) => {
+    const denial = policyDenial("move_note", { title, fromFolder: from_folder, toFolder: to_folder });
+    if (denial) return denial;
     try {
       const result = await applescript.moveNote(title, from_folder, to_folder);
       return { content: [{ type: "text", text: result }] };
@@ -211,6 +261,8 @@ server.registerTool(
     }),
   },
   async ({ title, content, folder }) => {
+    const denial = policyDenial("append_to_note", { title, folder });
+    if (denial) return denial;
     try {
       const result = await applescript.appendToNote(title, content, folder);
       return { content: [{ type: "text", text: result }] };
@@ -231,6 +283,8 @@ server.registerTool(
     }),
   },
   async ({ query, folder }) => {
+    const denial = readDenial(folder);
+    if (denial) return denial;
     try {
       const results = await applescript.searchNotes(query, folder);
       return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
@@ -244,7 +298,13 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Apple Notes MCP server running on stdio");
+  const writeDesc = policyActive
+    ? `write-policy: folder='${writePolicy.writeFolder}' prefix='${writePolicy.writePrefix}'`
+    : "write-policy: OFF";
+  const readDesc = readAllowlistActive
+    ? `read-allowlist: [${writePolicy.readAllowlist!.join(", ")}]`
+    : "read-allowlist: OFF (unrestricted)";
+  console.error(`Apple Notes MCP server running on stdio (${writeDesc}; ${readDesc})`);
 }
 
 main().catch((err) => {
