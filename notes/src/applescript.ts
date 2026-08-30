@@ -159,9 +159,54 @@ end tell`;
  * Exported because it is pure, so it can be unit-tested without touching a real
  * Notes database.
  */
+const HTML_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+};
+
+function unescapeHtml(value: string): string {
+  return value.replace(/&(?:amp|lt|gt|quot|#39);/g, (m) => HTML_ENTITIES[m] ?? m);
+}
+
+/** Tags stripped and entities resolved, repeatedly, until the text settles.
+ *
+ * One pass is not enough. The line that produced this bug was DOUBLE escaped
+ * ("&amp;lt;h1&amp;gt;…"), so a single unescape yields "&lt;h1&gt;…" — still
+ * not the title, and still a duplicate. Each pass can reveal markup the
+ * previous one left encoded, so strip and unescape until it stops changing.
+ * Bounded at four passes: this is comparison-only, and an unbounded loop over
+ * attacker-shaped input is not worth the tidiness.
+ */
+function plainText(value: string): string {
+  let previous = "";
+  let current = value;
+  for (let i = 0; i < 4 && current !== previous; i += 1) {
+    previous = current;
+    current = unescapeHtml(current.replace(/<[^>]*>/g, ""));
+  }
+  return current.trim();
+}
+
 export function bodyPreservingTitle(title: string, body: string): string {
+  const wanted = title.trim();
+
+  // A body whose FIRST LINE is just the title is a duplicate of the heading
+  // this function is about to add. The escaped spelling is the one that hurt:
+  // an HTML-escaped copy never equals the raw title, so it slipped past the
+  // startsWith check below and the note ended up with the title twice — once
+  // as the real <h1> and once as a stray escaped line. Drop it and let the
+  // single canonical heading be prepended.
+  const lines = body.split(/\r?\n/);
+  const firstLineText = plainText(lines[0]);
+  if (lines.length > 1 && firstLineText === wanted) {
+    return `<h1>${title}</h1>${lines.slice(1).join("\n")}`;
+  }
+
   const leadingText = body.replace(/<[^>]*>/g, "").trimStart();
-  if (leadingText.startsWith(title.trim())) {
+  if (leadingText.startsWith(wanted)) {
     return body;
   }
   return `<h1>${title}</h1>${body}`;

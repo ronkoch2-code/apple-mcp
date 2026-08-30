@@ -6,6 +6,7 @@ import {
   listNotes,
   getNote,
   createNote,
+  bodyPreservingTitle,
   updateNote,
   deleteNote,
   searchNotes,
@@ -206,5 +207,45 @@ describe("Apple Notes integration", () => {
     test("listNotes throws for non-existent folder", async () => {
       await expect(listNotes("NonExistentFolder-999999")).rejects.toThrow();
     }, 10_000);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// bodyPreservingTitle — duplicate-title suppression (fix #374)
+//
+// The #327 fix added the <h1> heading. It overshot: a body whose first line
+// was already an ESCAPED copy of the title never matched the raw title, so the
+// heading was prepended anyway and the note showed the title twice — once as
+// the real heading, once as a stray escaped line.
+// ---------------------------------------------------------------------------
+
+describe("bodyPreservingTitle", () => {
+  const title = "Groceries & Sundries";
+  const countTitles = (s: string) => (s.match(/Groceries/g) || []).length;
+
+  test("drops a double-escaped duplicate first line", () => {
+    const body = "&amp;lt;h1&amp;gt;Groceries &amp;amp; Sundries&amp;lt;/h1&amp;gt;\nmilk";
+    expect(countTitles(bodyPreservingTitle(title, body))).toBe(1);
+  });
+
+  test("drops a single-escaped duplicate first line", () => {
+    const body = "&lt;h1&gt;Groceries &amp; Sundries&lt;/h1&gt;\nmilk";
+    expect(countTitles(bodyPreservingTitle(title, body))).toBe(1);
+  });
+
+  test("drops a raw duplicate first line", () => {
+    expect(bodyPreservingTitle(title, "Groceries & Sundries\nmilk"))
+      .toBe(`<h1>${title}</h1>milk`);
+  });
+
+  test("still prepends the title when the body does not carry it", () => {
+    expect(bodyPreservingTitle(title, "milk\neggs"))
+      .toBe(`<h1>${title}</h1>milk\neggs`);
+  });
+
+  test("leaves a body already led by the title alone (the #327 path)", () => {
+    const body = `<h1>${title}</h1><div>milk</div>`;
+    expect(bodyPreservingTitle(title, body)).toBe(body);
   });
 });
